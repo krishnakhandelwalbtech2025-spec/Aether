@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AETHER: Single Unit Tracking System (Web)</title>
+    <style>
+        body { margin: 0; padding: 0; background: #000; overflow: hidden; font-family: 'Courier New', Courier, monospace; display: flex; }
+        
+        /* 1. Main Canvas (Left) */
+        #canvas-container { flex-grow: 1; position: relative; background: #000; cursor: crosshair; }
+        canvas { display: block; width: 100%; height: 100vh; }
+
+        /* 2. Sidebar (Right) - Matches your Python layout */
+        #sidebar { 
+            width: 300px; 
+            background: #111; 
+            height: 100vh; 
+            border-left: 1px solid #333; 
+            box-sizing: border-box; 
+            display: flex; 
+            flex-direction: column; 
+            padding-top: 20px;
+        }
+
+        .header { color: #00ff00; font-size: 20px; font-weight: bold; text-align: center; margin-bottom: 20px; }
+        
+        /* Row Styles */
+        .row { padding: 5px 20px; color: white; font-size: 14px; display: flex; justify-content: space-between; }
+        .label { color: #ccc; }
+        .val { font-weight: bold; color: cyan; }
+
+        /* Divider */
+        .divider { height: 2px; background: #333; margin: 20px 10px; }
+
+        /* Warnings */
+        #ui-warn { color: red; font-weight: bold; text-align: center; margin-top: 20px; min-height: 20px; }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container">
+        <canvas id="simCanvas"></canvas>
+    </div>
+
+    <div id="sidebar">
+        <div class="header">DRONE TELEMETRY</div>
+        
+        <div class="row"><span class="label">STATUS:</span><span id="ui-status" class="val">IDLE</span></div>
+        <div class="row"><span class="label">LOC:</span><span id="ui-loc" class="val">[0, 0]</span></div>
+        <div class="row"><span class="label">ALT:</span><span id="ui-alt" class="val">60m</span></div>
+        <div class="row"><span class="label">BATTERY:</span><span id="ui-bat" class="val">100%</span></div>
+        
+        <div class="divider"></div>
+        
+        <div class="row"><span class="label">WIND:</span><span id="ui-wind" class="val">0 km/h</span></div>
+        <div id="ui-warn"></div>
+    </div>
+
+<script>
+/** * AETHER WEB PORT
+ * Translating Python/Tkinter logic 1:1 to JavaScript/Canvas 
+ */
+
+// --- CONFIGURATION ---
+const GRID_SIZE = 16;
+const BUILDING_COUNT = 25;
+const TREE_COUNT = 20;
+const CAR_COUNT = 10;
+const BIRD_COUNT = 8;
+
+class Vector3 {
+    constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
+}
+
+class LidarSim {
+    constructor() {
+        this.canvas = document.getElementById('simCanvas');
+        this.ctx = this.canvas.getContext('2d');
+        
+        // Handle resizing
+        this.resize();
+        window.addEventListener('resize', () => this.resize());
+
+        // Camera
+        this.angle = 0.6;
+        this.scale = 20;
+        
+        // World Objects
+        this.buildings = [];
+        this.trees = [];
+        this.cars = [];
+        this.birds = [];
+        
+        this.generateWorld();
+
+        // Physics
+        this.windDir = new Vector3(1, 0, 0);
+        this.windSpeed = 0.0;
+        this.lastWindUpdate = Date.now();
+
+        // Drone State
+        this.dronePos = new Vector3(0, -60, 0);
+        this.droneTarget = null;
+        this.tempWaypoint = null;
+        this.state = "IDLE";
+        this.battery = 100.0;
+
+        // Input
+        window.addEventListener('keydown', (e) => {
+            if(e.key === "ArrowLeft") this.angle -= 0.1;
+            if(e.key === "ArrowRight") this.angle += 0.1;
+        });
+        this.canvas.addEventListener('mousedown', (e) => this.handleClick(e));
+
+        // Start Loop
+        requestAnimationFrame(() => this.animate());
+    }
+
+    resize() {
+        this.width = window.innerWidth - 300;
+        this.height = window.innerHeight;
+        this.canvas.width = this.width;
+        this.canvas.height = this.height;
+        this.centerX = this.width / 2;
+        this.centerY = this.height / 2 + 180;
+    }
+
+    generateWorld() {
+        // 1. Buildings
+        for(let i=0; i<BUILDING_COUNT; i++) {
+            let x = (Math.floor(Math.random() * GRID_SIZE * 2) - GRID_SIZE) * 2;
+            let z = (Math.floor(Math.random() * GRID_SIZE * 2) - GRID_SIZE) * 2;
+            this.buildings.push({x: x, z: z, w: 1.6, d: 1.6, h: 5 + Math.random()*9});
+        }
+        // 2. Trees (Pyramids)
+        for(let i=0; i<TREE_COUNT; i++) {
+            let x = (Math.floor(Math.random() * GRID_SIZE * 2) - GRID_SIZE) * 2;
+            let z = (Math.floor(Math.random() * GRID_SIZE * 2) - GRID_SIZE) * 2;
+            // Simple collision check against buildings
+            let collision = this.buildings.some(b => Math.abs(b.x - x) < 2 && Math.abs(b.z - z) < 2);
+            if (!collision) {
+                this.trees.push({x: x, z: z, h: 2 + Math.random()*3});
+            }
+        }
+        // 3. Cars
+        for(let i=0; i<CAR_COUNT; i++) {
+            this.cars.push({
+                x: (Math.random()*GRID_SIZE*4) - GRID_SIZE*2,
+                z: (Math.random()*GRID_SIZE*4) - GRID_SIZE*2,
+                axis: Math.random() > 0.5 ? 'x' : 'z',
+                speed: Math.random() > 0.5 ? 0.3 : -0.3
+            });
+        }
+        // 4. Birds
+        for(let i=0; i<BIRD_COUNT; i++) {
+            this.birds.push({
+                pos: new Vector3(Math.random()*60-30, -15 + Math.random()*-10, Math.random()*60-30),
+                vel: new Vector3(Math.random()*0.8-0.4, Math.random()*0.1-0.05, Math.random()*0.8-0.4)
+            });
+        }
+    }
+
+    project(x, y, z) {
+        let rx = x * Math.cos(this.angle) - z * Math.sin(this.angle);
+        let rz = x * Math.sin(this.angle) + z * Math.cos(this.angle);
+        return {
+            x: this.centerX + (rx * this.scale),
+            y: this.centerY + (y * this.scale) - (rz * this.scale * 0.5)
+        };
+    }
+
+    handleClick(e) {
+        let rect = this.canvas.getBoundingClientRect();
+        let mx = e.clientX - rect.left;
+        let my = e.clientY - rect.top;
+        
+        let closestDist = Infinity;
+        let targetB = null;
+
+        this.buildings.forEach(b => {
+            let p = this.project(b.x, 0, b.z);
+            let d = Math.sqrt((p.x - mx)**2 + (p.y - my)**2);
+            if (d < 60 && d < closestDist) {
+                closestDist = d;
+                targetB = b;
+            }
+        });
+
+        if (targetB) {
+            this.droneTarget = new Vector3(targetB.x, -targetB.h - 2.5, targetB.z);
+            this.tempWaypoint = null;
+            this.state = "MOVING";
+        }
+    }
+
+    checkObstacleCollision(nextPos) {
+        let radius = 0.8;
+        // Combine buildings and trees for collision check
+        let obstacles = [...this.buildings, ...this.trees];
+        
+        for (let obj of obstacles) {
+            // Trees use default width if not specified
+            let w = obj.w || 0.8; 
+            let d = obj.d || 0.8;
+            
+            if (nextPos.x > obj.x - w - radius && nextPos.x < obj.x + w + radius &&
+                nextPos.z > obj.z - d - radius && nextPos.z < obj.z + d + radius) {
+                if (nextPos.y > -obj.h) return obj;
+            }
+        }
+        return null;
+    }
+
+    updatePhysics() {
+        // Wind Update (every ~3s)
+        if (Date.now() - this.lastWindUpdate > 3000) {
+            this.windSpeed = Math.random() * 0.2;
+            this.windDir = new Vector3(Math.sin(Date.now()/1000), 0, Math.cos(Date.now()/1000));
+            this.lastWindUpdate = Date.now();
+        }
+
+        // Bird Logic
+        let closestBirdDist = 999;
+        this.birds.forEach(bird => {
+            bird.pos.x += bird.vel.x;
+            bird.pos.y += bird.vel.y;
+            bird.pos.z += bird.vel.z;
+            
+            // Boundary bounce
+            if (Math.abs(bird.pos.x) > GRID_SIZE * 3) bird.vel.x *= -1;
+            if (Math.abs(bird.pos.z) > GRID_SIZE * 3) bird.vel.z *= -1;
+
+            // Drone Avoidance Logic
+            let dx = bird.pos.x - this.dronePos.x;
+            let dy = bird.pos.y - this.dronePos.y;
+            let dz = bird.pos.z - this.dronePos.z;
+            let dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            
+            if (dist < closestBirdDist) closestBirdDist = dist;
+            
+            // "Bio-Hazard" repulsion
+            if (dist < 1.5) {
+                this.dronePos.x -= dx * 0.2;
+                this.dronePos.z -= dz * 0.2;
+            }
+        });
+
+        // UI Warning
+        let warnEl = document.getElementById('ui-warn');
+        warnEl.innerText = closestBirdDist < 4.0 ? "⚠️ BIO-HAZARD DETECTED" : "";
+
+        // Car Logic (Wrapping)
+        this.cars.forEach(car => {
+            if (car.axis === 'x') {
+                car.x += car.speed;
+                if (car.x > GRID_SIZE*2) car.x = -GRID_SIZE*2;
+                if (car.x < -GRID_SIZE*2) car.x = GRID_SIZE*2;
+            } else {
+                car.z += car.speed;
+                if (car.z > GRID_SIZE*2) car.z = -GRID_SIZE*2;
+                if (car.z < -GRID_SIZE*2) car.z = GRID_SIZE*2;
+            }
+        });
+    }
+
+    updateNavigation() {
+        if (!this.droneTarget) {
+            this.state = "IDLE";
+            return;
+        }
+
+        let activeTarget = this.tempWaypoint ? this.tempWaypoint : this.droneTarget;
+        let dx = activeTarget.x - this.dronePos.x;
+        let dy = activeTarget.y - this.dronePos.y;
+        let dz = activeTarget.z - this.dronePos.z;
+        let dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+        if (dist < 0.5) {
+            if (this.tempWaypoint) {
+                this.tempWaypoint = null;
+            } else {
+                this.droneTarget = null;
+                this.state = "DELIVERED";
+            }
+            return;
+        }
+
+        this.state = "MOVING";
+        let speed = 0.4;
+        let vx = (dx/dist) * speed;
+        let vy = (dy/dist) * speed;
+        let vz = (dz/dist) * speed;
+
+        vx += this.windDir.x * this.windSpeed;
+        vz += this.windDir.z * this.windSpeed;
+
+        let nextPos = new Vector3(this.dronePos.x + vx*8, this.dronePos.y + vy*8, this.dronePos.z + vz*8);
+        let obstacle = this.checkObstacleCollision(nextPos);
+
+        if (obstacle && !this.tempWaypoint) {
+            this.state = "AVOIDING OBSTACLE";
+            this.tempWaypoint = new Vector3(obstacle.x, -obstacle.h - 3, obstacle.z);
+        } else {
+            this.dronePos.x += vx; 
+            this.dronePos.y += vy; 
+            this.dronePos.z += vz;
+            this.battery -= 0.01;
+        }
+    }
+
+    updateUI() {
+        document.getElementById('ui-status').innerText = this.state;
+        document.getElementById('ui-loc').innerText = `[${Math.floor(this.dronePos.x)}, ${Math.floor(this.dronePos.z)}]`;
+        document.getElementById('ui-alt').innerText = `${Math.abs(Math.floor(this.dronePos.y))}m`;
+        
+        let batEl = document.getElementById('ui-bat');
+        batEl.innerText = `${Math.floor(this.battery)}%`;
+        batEl.style.color = this.battery < 20 ? 'red' : 'white';
+
+        document.getElementById('ui-wind').innerText = `${Math.floor(this.windSpeed * 100)} km/h`;
+    }
+
+    // --- DRAWING ---
+    drawCube(x, z, w, d, h, color) {
+        let y_b = 0;
+        let y_t = -h;
+        let v = [
+            this.project(x-w, y_b, z-d), this.project(x+w, y_b, z-d),
+            this.project(x+w, y_b, z+d), this.project(x-w, y_b, z+d),
+            this.project(x-w, y_t, z-d), this.project(x+w, y_t, z-d),
+            this.project(x+w, y_t, z+d), this.project(x-w, y_t, z+d)
+        ];
+        
+        this.ctx.strokeStyle = color;
+        this.ctx.lineWidth = 1.5;
+        this.ctx.beginPath();
+        // Base
+        this.ctx.moveTo(v[0].x, v[0].y); this.ctx.lineTo(v[1].x, v[1].y);
+        this.ctx.lineTo(v[2].x, v[2].y); this.ctx.lineTo(v[3].x, v[3].y);
+        this.ctx.lineTo(v[0].x, v[0].y);
+        // Top
+        this.ctx.moveTo(v[4].x, v[4].y); this.ctx.lineTo(v[5].x, v[5].y);
+        this.ctx.lineTo(v[6].x, v[6].y); this.ctx.lineTo(v[7].x, v[7].y);
+        this.ctx.lineTo(v[4].x, v[4].y);
+        // Sides
+        this.ctx.moveTo(v[0].x, v[0].y); this.ctx.lineTo(v[4].x, v[4].y);
+        this.ctx.moveTo(v[1].x, v[1].y); this.ctx.lineTo(v[5].x, v[5].y);
+        this.ctx.moveTo(v[2].x, v[2].y); this.ctx.lineTo(v[6].x, v[6].y);
+        this.ctx.moveTo(v[3].x, v[3].y); this.ctx.lineTo(v[7].x, v[7].y);
+        this.ctx.stroke();
+    }
+
+    drawPyramid(x, z, h, color) {
+        let w = 1.0;
+        let top = this.project(x, -h, z);
+        let base = [
+            this.project(x-w, 0, z-w), this.project(x+w, 0, z-w),
+            this.project(x+w, 0, z+w), this.project(x-w, 0, z+w)
+        ];
+        
+        this.ctx.strokeStyle = color;
+        this.ctx.beginPath();
+        // Base
+        this.ctx.moveTo(base[0].x, base[0].y); 
+        for(let i=1; i<4; i++) this.ctx.lineTo(base[i].x, base[i].y);
+        this.ctx.lineTo(base[0].x, base[0].y);
+        // Sides
+        for(let i=0; i<4; i++) {
+            this.ctx.moveTo(base[i].x, base[i].y);
+            this.ctx.lineTo(top.x, top.y);
+        }
+        this.ctx.stroke();
+    }
+
+    drawBird(bird) {
+        let p = this.project(bird.pos.x, bird.pos.y, bird.pos.z);
+        let wing = (Date.now() % 200 < 100) ? 3 : 6;
+        
+        this.ctx.lineWidth = 2;
+        this.ctx.beginPath();
+        // Wings
+        this.ctx.strokeStyle = "orange";
+        this.ctx.moveTo(p.x - wing, p.y); this.ctx.lineTo(p.x + wing, p.y);
+        this.ctx.stroke();
+        // Body
+        this.ctx.beginPath();
+        this.ctx.strokeStyle = "yellow";
+        this.ctx.moveTo(p.x, p.y - 2); this.ctx.lineTo(p.x, p.y + 2);
+        this.ctx.stroke();
+    }
+
+    animate() {
+        this.ctx.fillStyle = "black";
+        this.ctx.fillRect(0, 0, this.width, this.height);
+        
+        this.updatePhysics();
+        this.updateNavigation();
+        this.updateUI();
+
+        // 1. Grid
+        this.ctx.strokeStyle = "#222";
+        this.ctx.lineWidth = 1;
+        let gr = GRID_SIZE + 2;
+        for(let i=-gr; i<=gr; i++) {
+            let p1 = this.project(i*2, 0, -gr*2);
+            let p2 = this.project(i*2, 0, gr*2);
+            this.ctx.beginPath(); this.ctx.moveTo(p1.x, p1.y); this.ctx.lineTo(p2.x, p2.y); this.ctx.stroke();
+            
+            let p3 = this.project(-gr*2, 0, i*2);
+            let p4 = this.project(gr*2, 0, i*2);
+            this.ctx.beginPath(); this.ctx.moveTo(p3.x, p3.y); this.ctx.lineTo(p4.x, p4.y); this.ctx.stroke();
+        }
+
+        // 2. Objects
+        this.buildings.forEach(b => this.drawCube(b.x, b.z, b.w, b.d, b.h, "#0066ff"));
+        this.trees.forEach(t => this.drawPyramid(t.x, t.z, t.h, "#00ff66"));
+        this.cars.forEach(c => this.drawCube(c.x, c.z, 0.5, 0.8, 0.5, "#ff00ff"));
+        this.birds.forEach(b => this.drawBird(b));
+
+        // 3. Drone
+        this.drawCube(this.dronePos.x, this.dronePos.z, 0.6, 0.6, 0.6, "#ff0000");
+        let dScr = this.project(this.dronePos.x, this.dronePos.y, this.dronePos.z);
+        let gScr = this.project(this.dronePos.x, 0, this.dronePos.z);
+        
+        this.ctx.strokeStyle = "red";
+        this.ctx.setLineDash([2, 2]);
+        this.ctx.beginPath(); this.ctx.moveTo(dScr.x, dScr.y); this.ctx.lineTo(gScr.x, gScr.y); this.ctx.stroke();
+        this.ctx.setLineDash([]);
+
+        // 4. Wind Lines
+        if (this.windSpeed > 0.05) {
+            this.ctx.strokeStyle = "#333";
+            this.ctx.setLineDash([2, 4]);
+            for(let i=0; i<10; i++) {
+                let off = (Date.now()/50 + i*40) % this.width;
+                let sy = (this.height/2) + Math.sin(off/50)*30;
+                this.ctx.beginPath(); this.ctx.moveTo(off, sy); this.ctx.lineTo(off+30, sy); this.ctx.stroke();
+            }
+            this.ctx.setLineDash([]);
+        }
+
+        requestAnimationFrame(() => this.animate());
+    }
+}
+
+// Start
+const sim = new LidarSim();
+
+</script>
+</body>
+</html>
